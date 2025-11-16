@@ -9,7 +9,7 @@ import traceback
 import gspread
 from google.oauth2.service_account import Credentials
 
-TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN", "7945043414:AAFsWTcwFPWM-GH8-keyxdAf9oqQNt6FJlo")
+TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN", "8579096962:AAHLE-OEdiNbmc7TydZ5uN5fM7kEJ1tecC4")
 ADMINS = [8133757512]
 DATA_FILE = "data.json"
 
@@ -26,7 +26,6 @@ WELCOME_TEXT = (
     "- 🔔 Напоминать за час до приёма;\n"
     "- 📨 Принимать запросы и предложения для админа;\n"
     "- ✉️ Пересылать сообщения специалистам — админ ответит вам напрямую;\n"
-    "- ⚙️ Управлять расписанием через админ‑панель (для админов).\n\n"
     "Нажмите «🔘 Начать» или отправьте /start, чтобы открыть меню.\n"
     "Если нужно — напишите «Запрос» или «Предложение», либо выберите специалиста из списка.\n\n"
     "✨ Я работаю круглосуточно, чтобы сделать запись проще и удобнее для вас!"
@@ -378,7 +377,12 @@ def all_text_handler(message):
                         m["answered_ts"] = datetime.now().isoformat()
                         break
                 save_data(data)
-                bot.send_message(chat_id, "✅ Ответ отправлен.", reply_markup=main_keyboard(user_id))
+                bot.send_message(chat_id, "✅ Ответ отправлен.")
+                # обновим панель сообщений для администратора
+                try:
+                    show_messages_admin(chat_id)
+                except Exception:
+                    pass
                 pending_action.pop(chat_id, None)
                 return
 
@@ -838,10 +842,15 @@ def show_messages_admin(chat_id, edit_message=False, message_id=None):
             tag = m.get("tag", "")
             from_username = m.get("from_username", f"id{m.get('from_id','?')}")
             text = m.get("text", "")
-            out_lines.append(f"📨 ID {mid} | {tag} | {from_username}\n{text}")
-            btn_reply = types.InlineKeyboardButton(f"Ответить #{mid}", callback_data=f"reply|{mid}")
+            answered = bool(m.get("answered"))
+            status = " ✅ Отвечено" if answered else ""
+            out_lines.append(f"📨 ID {mid} | {tag} | {from_username}{status}\n{text}")
             btn_del = types.InlineKeyboardButton(f"Удалить #{mid}", callback_data=f"delmsg|{mid}")
-            kb.add(btn_reply, btn_del)
+            if not answered:
+                btn_reply = types.InlineKeyboardButton(f"Ответить #{mid}", callback_data=f"reply|{mid}")
+                kb.add(btn_reply, btn_del)
+            else:
+                kb.add(btn_del)
 
         kb.add(types.InlineKeyboardButton("Удалить все сообщения", callback_data="delmsg|all"))
         out = "\n\n".join(out_lines)
