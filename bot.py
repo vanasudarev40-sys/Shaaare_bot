@@ -6,6 +6,8 @@ import os
 from datetime import datetime, timedelta
 import time
 import traceback
+import gspread
+from google.oauth2.service_account import Credentials
 
 TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TOKEN", "7945043414:AAFsWTcwFPWM-GH8-keyxdAf9oqQNt6FJlo")
 ADMINS = [8133757512]
@@ -50,6 +52,63 @@ def save_data(data):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
+# Google Sheets integration
+GSHEET_ID = os.environ.get("GSHEET_ID") or os.environ.get("SHEET_ID")
+_GS_CLIENT = None
+
+def get_gs_client():
+    global _GS_CLIENT
+    if _GS_CLIENT:
+        return _GS_CLIENT
+    creds_json = os.environ.get("GS_CREDS_JSON")
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    try:
+        if creds_json:
+            info = json.loads(creds_json)
+            creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        elif creds_path and os.path.exists(creds_path):
+            creds = Credentials.from_service_account_file(creds_path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        else:
+            print("[GS] No credentials found (GS_CREDS_JSON or GOOGLE_APPLICATION_CREDENTIALS)")
+            return None
+        _GS_CLIENT = gspread.authorize(creds)
+        return _GS_CLIENT
+    except Exception as e:
+        print("[GS] Failed to init gspread client:", e)
+        return None
+
+def append_row_to_sheet(sheet_name, row):
+    client = get_gs_client()
+    if not client or not GSHEET_ID:
+        return False
+    try:
+        sh = client.open_by_key(GSHEET_ID)
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=20)
+        ws.append_row(row, value_input_option='USER_ENTERED')
+        return True
+    except Exception as e:
+        print("[GS] Failed to append row:", e)
+        return False
+
+def append_booking_to_sheet(rec):
+    try:
+        row = [datetime.now().isoformat(), rec.get('user_id'), rec.get('username'), rec.get('spec'), rec.get('date'), rec.get('time')]
+        return append_row_to_sheet('Bookings', row)
+    except Exception as e:
+        print("[GS] append_booking error:", e)
+        return False
+
+def append_message_to_sheet(msg):
+    try:
+        row = [datetime.now().isoformat(), msg.get('from_id'), msg.get('from_username'), msg.get('tag'), msg.get('spec', ''), msg.get('text')]
+        return append_row_to_sheet('Messages', row)
+    except Exception as e:
+        print("[GS] append_message error:", e)
+        return False
+
 def safe_edit_message(chat_id, message_id, text, reply_markup=None):
     try:
         bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
@@ -59,14 +118,23 @@ def safe_edit_message(chat_id, message_id, text, reply_markup=None):
             bot.send_message(chat_id, text, reply_markup=reply_markup)
         except Exception as e2:
             print("safe_edit fallback failed:", e2)
-
 def get_username(user):
-    if getattr(user, "username", None):
-        return f"@{user.username}"
-    first = getattr(user, "first_name", "") or ""
-    last = getattr(user, "last_name", "") or ""
-    return (first + " " + last).strip() or f"id{user.id}"
-
+    if not user:
+        return "unknown"
+    parts = []
+    if getattr(user, 'first_name', None):
+        parts.append(user.first_name)
+    if getattr(user, 'last_name', None):
+        parts.append(user.last_name)
+    name = " ".join(parts).strip()
+    if getattr(user, 'username', None):
+        uname = user.username
+        if name:
+            return f"{name} (@{uname})"
+        return f"@{uname}"
+    if name:
+        return name
+    return f"id{getattr(user, 'id', '?')}"
 def remove_reply_kb():
     return types.ReplyKeyboardRemove()
 
@@ -186,9 +254,11 @@ def all_text_handler(message):
                 if name and name not in data["specialists"]:
                     data["specialists"].append(name)
                     save_data(data)
-                    bot.send_message(chat_id, f"✅ Добавлен специалист: {name}", reply_markup=specialists_manage_keyboard())
+                    # show updated specialists inline panel
+                    bot.send_message(chat_id, f"✅ Добавлен специалист: {name}")
+                    show_specialists_admin(chat_id)
                 else:
-                    bot.send_message(chat_id, "Имя пустое или уже существует.", reply_markup=specialists_manage_keyboard())
+                    bot.send_message(chat_id, "Имя пустое или уже существует.")
                 pending_action.pop(chat_id, None)
                 return
 
@@ -206,7 +276,8 @@ def all_text_handler(message):
                         else:
                             data["records"].pop(uid, None)
                     save_data(data)
-                    bot.send_message(chat_id, f"❌ Специалист '{name}' удалён, связанные записи и расписание удалены.", reply_markup=specialists_manage_keyboard())
+                    bot.send_message(chat_id, f"❌ Специалист '{name}' удалён, связанные записи и расписание удалены.")
+                    show_specialists_admin(chat_id)
                 else:
                     bot.send_message(chat_id, "Специалист с таким именем не найден.", reply_markup=specialists_manage_keyboard())
                 pending_action.pop(chat_id, None)
@@ -225,7 +296,8 @@ def all_text_handler(message):
                             if r.get("spec") == old_name:
                                 r["spec"] = new_name
                     save_data(data)
-                    bot.send_message(chat_id, f"✏️ '{old_name}' переименован в '{new_name}'", reply_markup=specialists_manage_keyboard())
+                    bot.send_message(chat_id, f"✏️ '{old_name}' переименован в '{new_name}'")
+                    show_specialists_admin(chat_id)
                 else:
                     bot.send_message(chat_id, "Ошибка: старое имя не найдено или новое имя пустое.", reply_markup=specialists_manage_keyboard())
                 pending_action.pop(chat_id, None)
@@ -239,6 +311,10 @@ def all_text_handler(message):
                 data.setdefault("messages", []).append(msg_obj)
                 data["next_message_id"] = mid + 1
                 save_data(data)
+                try:
+                    append_message_to_sheet(msg_obj)
+                except Exception:
+                    print("Failed to append message to Google Sheets", traceback.format_exc())
                 bot.send_message(chat_id, f"Ваше сообщение сохранено {tag}:\n\n{text}", reply_markup=main_keyboard(user_id))
                 for adm in ADMINS:
                     try:
@@ -265,6 +341,10 @@ def all_text_handler(message):
                 data.setdefault("messages", []).append(msg_obj)
                 data["next_message_id"] = mid + 1
                 save_data(data)
+                try:
+                    append_message_to_sheet(msg_obj)
+                except Exception:
+                    print("Failed to append message to Google Sheets", traceback.format_exc())
                 bot.send_message(chat_id, f"✉️ Ваше сообщение специалисту '{spec}' отправлено администраторам. Админ постарается ответить как можно скорее.", reply_markup=main_keyboard(user_id))
                 for adm in ADMINS:
                     try:
@@ -376,7 +456,7 @@ def all_text_handler(message):
                 bot.send_message(chat_id, "Выберите специалиста для управления временем:", reply_markup=kb)
                 return
             if text == "👥 Управление специалистов":
-                bot.send_message(chat_id, "Управление специалистами:", reply_markup=specialists_manage_keyboard())
+                show_specialists_admin(chat_id)
                 return
             if text == "Добавить специалиста":
                 pending_action[chat_id] = {"action": "spec_add"}
@@ -477,6 +557,10 @@ def inline_callbacks(cb):
             data["records"][uid_str].append(rec)
             data["schedule"][spec][date_iso].remove(t)
             save_data(data)
+            try:
+                append_booking_to_sheet(rec)
+            except Exception:
+                print("Failed to append booking to Google Sheets", traceback.format_exc())
             safe_edit_message(chat_id, cb.message.message_id, f"✅ Вы записаны к {spec}\n📅 {date_iso}\n⏰ {t}")
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("📋 Посмотреть все записи", callback_data="admin_show_records"))
@@ -623,20 +707,67 @@ def inline_callbacks(cb):
                 except Exception:
                     print("failed to update admin notifications after del all", traceback.format_exc())
                 return
-            else:
-                try:
-                    mid = int(target)
-                    new_msgs = [m for m in msgs if m.get("id") != mid]
-                    data["messages"] = new_msgs
-                    save_data(data)
-                    safe_edit_message(chat_id, cb.message.message_id, f"✅ Сообщение {mid} удалено.")
-                    try:
-                        increment_admin_notifications_for_all(data)
-                    except Exception:
-                        print("failed to update admin notifications after del one", traceback.format_exc())
-                except Exception:
-                    safe_edit_message(chat_id, cb.message.message_id, "Ошибка удаления сообщения.")
-                return
+
+        if payload == "spec_add" and user_id in ADMINS:
+            pending_action[chat_id] = {"action": "spec_add"}
+            bot.send_message(chat_id, "Введите имя нового специалиста:", reply_markup=remove_reply_kb())
+            return
+
+        if payload.startswith("spec_delete|") and user_id in ADMINS:
+            # show confirmation before deleting
+            try:
+                _, idx_s = payload.split("|", 1)
+                idx = int(idx_s)
+                spec = data.get("specialists", [])[idx]
+                kb = types.InlineKeyboardMarkup()
+                kb.add(types.InlineKeyboardButton(f"Удалить {spec}", callback_data=f"confirm_delete|{idx}"))
+                kb.add(types.InlineKeyboardButton("Отмена", callback_data="cancel_spec_action"))
+                safe_edit_message(chat_id, cb.message.message_id, f"Вы уверены, что хотите удалить специалиста '{spec}'? Это удалит расписание и связанные записи.", reply_markup=kb)
+            except Exception:
+                safe_edit_message(chat_id, cb.message.message_id, "Ошибка при подготовке удаления специалиста.")
+            return
+
+        if payload.startswith("spec_rename|") and user_id in ADMINS:
+            try:
+                _, idx_s = payload.split("|", 1)
+                idx = int(idx_s)
+                spec = data.get("specialists", [])[idx]
+                pending_action[chat_id] = {"action": "spec_rename", "old_name": spec}
+                bot.send_message(chat_id, f"Введите новое имя для {spec}:", reply_markup=remove_reply_kb())
+            except Exception:
+                bot.answer_callback_query(cb.id, "Ошибка при выборе специалиста для переименования.")
+            return
+
+        if payload.startswith("confirm_delete|") and user_id in ADMINS:
+            try:
+                _, idx_s = payload.split("|", 1)
+                idx = int(idx_s)
+                spec = data.get("specialists", [])[idx]
+                # perform deletion
+                data["specialists"].pop(idx)
+                data.get("schedule", {}).pop(spec, None)
+                recs_all = data.get("records", {})
+                for uid in list(recs_all.keys()):
+                    recs = recs_all[uid]
+                    new_recs = [r for r in recs if r.get("spec") != spec]
+                    if new_recs:
+                        data["records"][uid] = new_recs
+                    else:
+                        data["records"].pop(uid, None)
+                save_data(data)
+                safe_edit_message(chat_id, cb.message.message_id, f"❌ Специалист '{spec}' удалён.")
+                show_specialists_admin(chat_id, edit_message=True, message_id=cb.message.message_id)
+            except Exception:
+                safe_edit_message(chat_id, cb.message.message_id, "Ошибка при удалении специалиста.")
+            return
+
+        if payload == "cancel_spec_action" and user_id in ADMINS:
+            # refresh specialists panel
+            try:
+                show_specialists_admin(chat_id, edit_message=True, message_id=cb.message.message_id)
+            except Exception:
+                safe_edit_message(chat_id, cb.message.message_id, "Отмена.")
+            return
 
     except Exception:
         print("Error in inline_callbacks:", traceback.format_exc())
@@ -733,6 +864,32 @@ def show_edit_specialists(chat_id):
     kb.add("Добавить специалиста", "Удалить специалиста", "Переименовать специалиста")
     kb.add("🔙 На главную")
     bot.send_message(chat_id, "Управление специалистами:", reply_markup=kb)
+
+
+def show_specialists_admin(chat_id, edit_message=False, message_id=None):
+    data = load_data()
+    specs = data.get("specialists", [])
+    if not specs:
+        text = "Список специалистов пуст."
+        if edit_message and message_id:
+            safe_edit_message(chat_id, message_id, text)
+        else:
+            bot.send_message(chat_id, text)
+        return
+
+    text = "👥 Список специалистов:\n\n"
+    kb = types.InlineKeyboardMarkup()
+    for idx, s in enumerate(specs):
+        kb.add(
+            types.InlineKeyboardButton(f"🗑 {s}", callback_data=f"spec_delete|{idx}"),
+            types.InlineKeyboardButton(f"✏️ {s}", callback_data=f"spec_rename|{idx}")
+        )
+    kb.add(types.InlineKeyboardButton("➕ Добавить специалиста", callback_data="spec_add"))
+    kb.add(types.InlineKeyboardButton("🔙 На админку", callback_data="admin_menu_back"))
+    if edit_message and message_id:
+        safe_edit_message(chat_id, message_id, text, reply_markup=kb)
+    else:
+        bot.send_message(chat_id, text, reply_markup=kb)
 
 def reminders_loop():
     while True:
